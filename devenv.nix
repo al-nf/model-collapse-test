@@ -9,12 +9,7 @@
   languages.python = {
     enable = true;
     venv.enable = true;
-    venv.requirements = pkgs.lib.mkForce ''
-      torch
-      torchvision
-      pillow
-      numpy
-    '';
+    venv.requirements = ./requirements.txt;
   };
 
   # https://devenv.sh/packages/

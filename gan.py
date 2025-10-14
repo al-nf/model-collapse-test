@@ -3,7 +3,7 @@ import os
 import math
 import random
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ from PIL import Image
 import numpy as np
 
 NUM_EPOCHS = 160
-MINI_BATCH_SIZE = 3
+MINI_BATCH_SIZE = 32
 LEARN_RATE = 1e-4
 BETA1 = 0.5
 BETA2 = 0.999
@@ -118,19 +118,17 @@ def gan_loss(prob_real, prob_generated):
     return loss_generator, loss_discriminator
 
 
-def make_dataloader(folder: Path, batch_size=3, max_images=150):
+def make_dataloader(folder: Path, batch_size=MINI_BATCH_SIZE):
     if not folder.exists():
         return None
     imgs = [p for p in folder.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')]
     if len(imgs) == 0:
         return None
-    if len(imgs) > max_images:
-        imgs = random.sample(imgs, max_images)
 
     transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.ToTensor(),  # [0,1]
-        transforms.Lambda(lambda t: t * 2 - 1)  # [-1,1]
+        transforms.ToTensor(), 
+        transforms.Lambda(lambda t: t * 2 - 1) 
     ])
 
     class SimpleFolder(torch.utils.data.Dataset):
@@ -151,20 +149,16 @@ def make_dataloader(folder: Path, batch_size=3, max_images=150):
     return dl
 
 
-
-def save_image_grid(tensor, out_path):
-    grid = utils.make_grid((tensor + 1) / 2, nrow=8, padding=2)
-    ndarr = grid.mul(255).byte().permute(1, 2, 0).cpu().numpy()
-    Image.fromarray(ndarr).save(out_path)
-
-
-def save_generated_batch_as_files(tensor, out_dir, iteration, base_seed=None):
+def save(tensor, out_dir, prefix: Optional[str] = None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tensor = (tensor + 1) / 2
     for i, img in enumerate(tensor):
-        fname = f'gen_{i:04d}.png'
+        if prefix:
+            fname = f'gen_{prefix}_{i:04d}.png'
+        else:
+            fname = f'gen_{i:04d}.png'
         path = out_dir / fname
         utils.save_image(img, str(path))
 
@@ -175,7 +169,7 @@ def train_for_folder():
     path_gen = Path('./data/gen')
     path_gen.mkdir(parents=True, exist_ok=True)
 
-    dataloader = make_dataloader(path_real, batch_size=MINI_BATCH_SIZE, max_images=150)
+    dataloader = make_dataloader(path_real, batch_size=MINI_BATCH_SIZE)
     if dataloader is None:
         print(f'No images in {path_real}, skipping')
         return
@@ -206,37 +200,42 @@ def train_for_folder():
             fake = netG(z)
             d_fake = netD(fake.detach())
 
-            prob_real = sigmoid(d_real)
-            prob_fake = sigmoid(d_fake)
+            real_targets = torch.ones_like(d_real, device=device)
+            fake_targets = torch.zeros_like(d_fake, device=device)
 
-            num_obs = prob_real.shape[0]
+            num_obs = real_targets.shape[0]
             num_to_flip = int(math.floor(FLIP_FACTOR * num_obs))
             if num_to_flip > 0:
                 flip_idx = random.sample(range(num_obs), num_to_flip)
-                prob_real[flip_idx] = 1 - prob_real[flip_idx]
+                real_targets[flip_idx] = 0.0
 
-            lossG, lossD = gan_loss(prob_real, prob_fake)
+            criterion = nn.BCEWithLogitsLoss()
+            lossD = criterion(d_real, real_targets) + criterion(d_fake, fake_targets)
 
             optimD.zero_grad()
-            lossD.backward(retain_graph=True)
+            lossD.backward()
             optimD.step()
 
             d_fake_forG = netD(netG(z))
-            prob_fake_forG = sigmoid(d_fake_forG)
-            lossG2, _ = gan_loss(prob_real, prob_fake_forG)
+            real_targets_forG = torch.ones_like(d_fake_forG, device=device)
+            lossG2 = criterion(d_fake_forG, real_targets_forG)
             optimG.zero_grad()
             lossG2.backward()
             optimG.step()
 
-            scoreD = ((prob_real.mean() + (1 - prob_fake.mean())) / 2).item()
-            scoreG = prob_fake.mean().item()
+            with torch.no_grad():
+                prob_real = torch.sigmoid(d_real)
+                prob_fake = torch.sigmoid(d_fake)
+                scoreD = ((prob_real.mean() + (1 - prob_fake.mean())) / 2).item()
+                scoreG = prob_fake.mean().item()
 
             if iteration % VALIDATION_FREQUENCY == 0 or iteration == 1:
                 with torch.no_grad():
                     gval = netG(z_val)
-                    if epoch > (NUM_EPOCHS // 8):
+                    if epoch > (NUM_EPOCHS // 2):
                         try:
-                            save_generated_batch_as_files(gval[:NUM_VALIDATION_IMAGES], path_gen, iteration)
+                            prefix = f'iter{iteration:06d}_ep{epoch:03d}'
+                            save(gval[:NUM_VALIDATION_IMAGES], path_gen, prefix=prefix)
                         except Exception:
                             pass
 
