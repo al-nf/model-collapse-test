@@ -11,3 +11,5 @@ devenv.local.nix
 data/gen
 data/training/*
 !data/training/put_training_images_here
+
+__pycache__/
