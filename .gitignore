@@ -9,5 +9,5 @@ devenv.local.nix
 .pre-commit-config.yaml
 
 data/gen
-data/training
+data/training/*
 !data/training/put_training_images_here
