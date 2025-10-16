@@ -2,6 +2,7 @@
 import os
 import math
 import random
+import logging
 from pathlib import Path
 from typing import Tuple, Optional
 
@@ -25,6 +26,9 @@ IMAGE_SIZE = 64
 NUM_VALIDATION_IMAGES = 40
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+logger = logging.getLogger()
+logging.basicConfig(level=logging.INFO)
 
 
 def weights_init(m):
@@ -241,6 +245,7 @@ def train_for_folder():
 
             if iteration % 10 == 0:
                 print(f'Training Epoch {epoch} Iter {iteration} | G_loss {lossG2.item():.4f} D_loss {lossD.item():.4f} | sG {scoreG:.4f} sD {scoreD:.4f}')
+                logging.info(f'G_loss {lossG2.item():.4f} | D_loss {lossD.item():.4f}')
 
     print(f'Finished training on {path_real}')
 

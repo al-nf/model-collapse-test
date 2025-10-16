@@ -17,6 +17,10 @@
     pkgs.nushell
   ];
 
+  processes = {
+    gan.exec = "python gan.py";
+  };
+
   # See full reference at https://devenv.sh/reference/options/
 }
 
