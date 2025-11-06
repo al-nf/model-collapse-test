@@ -47,8 +47,6 @@ def weights_init(m):
 
 
 class ProjectAndReshape(nn.Module):
-    """Mimic the projectAndReshapeLayer: fully connected projection then reshape."""
-
     def __init__(self, output_size: Tuple[int, int, int], num_channels: int):
         super().__init__()
         self.output_size = output_size
@@ -122,13 +120,49 @@ def gan_loss(prob_real, prob_generated):
     return loss_generator, loss_discriminator
 
 
-def make_dataloader(folder: Path, batch_size=MINI_BATCH_SIZE):
-    if not folder.exists():
-        return None
-    imgs = [p for p in folder.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')]
-    if len(imgs) == 0:
-        return None
+def save(tensor, out_dir, prefix: Optional[str] = None):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    tensor = (tensor + 1) / 2
+    for i, img in enumerate(tensor):
+        if prefix:
+            fname = f'gen_{prefix}_{i:04d}.png'
+        else:
+            fname = f'gen_{i:04d}.png'
+        path = out_dir / fname
+        utils.save_image(img, str(path))
+
+    return out_dir
+
+def make_mixed_dataloader(real_folder: Path, gen_folder: Optional[Path], gen_ratio: float, batch_size=MINI_BATCH_SIZE):
+    if not real_folder.exists():
+        return None
+    
+    real_imgs = [p for p in real_folder.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')]
+    if len(real_imgs) == 0:
+        return None
+    
+    gen_imgs = []
+    if gen_folder is not None and gen_folder.exists():
+        gen_imgs = [p for p in gen_folder.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')]
+    
+    if len(gen_imgs) > 0 and gen_ratio > 0:
+        num_real = int(len(real_imgs) * (1 - gen_ratio))
+        num_gen = int(len(real_imgs) * gen_ratio)
+        
+        num_real = max(1, num_real)
+        num_gen = min(len(gen_imgs), num_gen)
+        
+        selected_real = random.sample(real_imgs, min(num_real, len(real_imgs)))
+        selected_gen = random.sample(gen_imgs, num_gen)
+        
+        all_imgs = selected_real + selected_gen
+        print(f"Mixed dataset: {len(selected_real)} real + {len(selected_gen)} generated = {len(all_imgs)} total")
+    else:
+        all_imgs = real_imgs
+        print(f"Pure real dataset: {len(all_imgs)} images")
+    
     transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(), 
@@ -148,34 +182,21 @@ def make_dataloader(folder: Path, batch_size=MINI_BATCH_SIZE):
             img = Image.open(p).convert('RGB')
             return self.transform(img)
 
-    ds = SimpleFolder(imgs, transform)
+    ds = SimpleFolder(all_imgs, transform)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
     return dl
 
 
-def save(tensor, out_dir, prefix: Optional[str] = None):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def train_for_folder(round_num: int, path_real: Path, path_gen_prev: Optional[Path], path_gen_out: Path, gen_ratio: float):
+    path_gen_out.mkdir(parents=True, exist_ok=True)
 
-    tensor = (tensor + 1) / 2
-    for i, img in enumerate(tensor):
-        if prefix:
-            fname = f'gen_{prefix}_{i:04d}.png'
-        else:
-            fname = f'gen_{i:04d}.png'
-        path = out_dir / fname
-        utils.save_image(img, str(path))
+    print(f"\n{'='*60}")
+    print(f"ROUND {round_num}: Training with {gen_ratio*100:.1f}% generated data")
+    print(f"{'='*60}")
 
-    return out_dir
-
-def train_for_folder():
-    path_real = Path('./data/training')
-    path_gen = Path('./data/gen')
-    path_gen.mkdir(parents=True, exist_ok=True)
-
-    dataloader = make_dataloader(path_real, batch_size=MINI_BATCH_SIZE)
+    dataloader = make_mixed_dataloader(path_real, path_gen_prev, gen_ratio, batch_size=MINI_BATCH_SIZE)
     if dataloader is None:
-        print(f'No images in {path_real}, skipping')
+        print(f'No images available, skipping round {round_num}')
         return
 
     netG = Generator(num_latent=NUM_LATENT).to(device)
@@ -238,20 +259,61 @@ def train_for_folder():
                     gval = netG(z_val)
                     if epoch > (NUM_EPOCHS // 2):
                         try:
-                            prefix = f'iter{iteration:06d}_ep{epoch:03d}'
-                            save(gval[:NUM_VALIDATION_IMAGES], path_gen, prefix=prefix)
+                            prefix = f'round{round_num}_iter{iteration:06d}_ep{epoch:03d}'
+                            save(gval[:NUM_VALIDATION_IMAGES], path_gen_out, prefix=prefix)
                         except Exception:
                             pass
 
             if iteration % 10 == 0:
-                print(f'Training Epoch {epoch} Iter {iteration} | G_loss {lossG2.item():.4f} D_loss {lossD.item():.4f} | sG {scoreG:.4f} sD {scoreD:.4f}')
-                logging.info(f'G_loss {lossG2.item():.4f} | D_loss {lossD.item():.4f}')
+                print(f'Round {round_num} | Epoch {epoch} Iter {iteration} | G_loss {lossG2.item():.4f} D_loss {lossD.item():.4f} | sG {scoreG:.4f} sD {scoreD:.4f}')
+                logging.info(f'Round {round_num} | G_loss {lossG2.item():.4f} | D_loss {lossD.item():.4f}')
 
-    print(f'Finished training on {path_real}')
+    print(f'Finished round {round_num}')
+    
+    with torch.no_grad():
+        z_final = torch.randn(NUM_VALIDATION_IMAGES, NUM_LATENT, device=device)
+        gval_final = netG(z_final)
+        save(gval_final, path_gen_out, prefix=f'round{round_num}_final')
+    
+    return netG
 
 
 def main():
-    train_for_folder()
+    NUM_ROUNDS = 10 
+    path_real = Path('./data/training')
+    base_gen_path = Path('./data/gen')
+    
+    if not path_real.exists() or len(list(path_real.glob('*.*'))) == 0:
+        print(f"Error: No training images found in {path_real}")
+        print("Please place training images in ./data/training/")
+        return
+    
+    print(f"Starting {NUM_ROUNDS} rounds of training with progressive data injection")
+    print(f"Real training data: {path_real}")
+    
+    path_gen_prev = None
+    
+    for round_num in range(1, NUM_ROUNDS + 1):
+        gen_ratio = (round_num - 1) * 0.10
+        
+        path_gen_out = base_gen_path / f'round_{round_num}'
+        
+        train_for_folder(
+            round_num=round_num,
+            path_real=path_real,
+            path_gen_prev=path_gen_prev,
+            path_gen_out=path_gen_out,
+            gen_ratio=gen_ratio
+        )
+        
+        path_gen_prev = path_gen_out
+        
+        print(f"\nRound {round_num} complete. Generated images saved to: {path_gen_out}")
+    
+    print(f"\n{'='*60}")
+    print("All rounds complete!")
+    print(f"Results saved in: {base_gen_path}")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':
