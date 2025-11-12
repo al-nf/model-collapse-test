@@ -14,7 +14,7 @@ from torchvision import transforms, datasets, utils
 from PIL import Image
 import numpy as np
 
-NUM_EPOCHS = 160
+NUM_EPOCHS = 30
 MINI_BATCH_SIZE = 32
 LEARN_RATE = 1e-4
 BETA1 = 0.5
@@ -23,7 +23,7 @@ FLIP_FACTOR = 0.3
 VALIDATION_FREQUENCY = 20
 NUM_LATENT = 100
 IMAGE_SIZE = 64
-NUM_VALIDATION_IMAGES = 40
+NUM_VALIDATION_IMAGES = 15
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
