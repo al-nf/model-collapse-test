@@ -135,13 +135,17 @@ def save(tensor, out_dir, prefix: Optional[str] = None):
 
     return out_dir
 
-def make_mixed_dataloader(real_folder: Path, gen_folder: Optional[Path], gen_ratio: float, batch_size=MINI_BATCH_SIZE):
+def make_mixed_dataloader(real_folder: Path, gen_folder: Optional[Path], gen_ratio: float, batch_size=MINI_BATCH_SIZE, max_real_images=2000):
     if not real_folder.exists():
         return None
     
     real_imgs = [p for p in real_folder.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')]
     if len(real_imgs) == 0:
         return None
+    
+    if len(real_imgs) > max_real_images:
+        real_imgs = random.sample(real_imgs, max_real_images)
+        print(f"Subsampled dataset from full size to {max_real_images} images")
     
     gen_imgs = []
     if gen_folder is not None and gen_folder.exists():
