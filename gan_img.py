@@ -281,7 +281,7 @@ def train_for_folder(round_num: int, path_real: Path, path_gen_prev: Optional[Pa
             real_c = label2onehot(real_label, NUM_DOMAINS).to(device)
             target_c = label2onehot(target_label, NUM_DOMAINS).to(device)
 
-            # Train Discriminator
+            # train discr
             out_src, out_cls = netD(real_x)
             d_loss_real = -torch.mean(out_src)
             d_loss_cls = classification_loss(out_cls, real_label)
@@ -297,7 +297,7 @@ def train_for_folder(round_num: int, path_real: Path, path_gen_prev: Optional[Pa
             d_loss.backward()
             optimD.step()
 
-            # Train Generator
+            # train gen
             if iteration % 5 == 0:
                 fake_x = netG(real_x, target_c)
                 out_src, out_cls = netD(fake_x)
