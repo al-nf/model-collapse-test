@@ -15,15 +15,18 @@ from PIL import Image
 import numpy as np
 
 NUM_EPOCHS = 30
-MINI_BATCH_SIZE = 32
+MINI_BATCH_SIZE = 16
 LEARN_RATE = 1e-4
 BETA1 = 0.5
 BETA2 = 0.999
-FLIP_FACTOR = 0.3
+FLIP_FACTOR = 0.0
 VALIDATION_FREQUENCY = 20
-NUM_LATENT = 100
-IMAGE_SIZE = 64
+NUM_DOMAINS = 5
+IMAGE_SIZE = 128
 NUM_VALIDATION_IMAGES = 15
+LAMBDA_CLS = 1.0
+LAMBDA_REC = 10.0
+LAMBDA_GP = 10.0
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -46,78 +49,125 @@ def weights_init(m):
         pass
 
 
-class ProjectAndReshape(nn.Module):
-    def __init__(self, output_size: Tuple[int, int, int], num_channels: int):
+class ResidualBlock(nn.Module):
+    def __init__(self, dim_in, dim_out):
         super().__init__()
-        self.output_size = output_size
-        fc_out = output_size[0] * output_size[1] * output_size[2]
-        self.fc = nn.Linear(num_channels, fc_out)
+        self.main = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=True)
+        )
 
     def forward(self, x):
-        if x.dim() == 4:
-            x = x.view(x.size(0), x.size(1))
-        x = self.fc(x)
-        x = x.view(x.size(0), self.output_size[2], self.output_size[0], self.output_size[1])
-        return x
+        return x + self.main(x)
 
 
 class Generator(nn.Module):
-    def __init__(self, num_latent=100, ngf=64, out_channels=3):
+    """StarGAN Generator with encoder-decoder architecture."""
+    def __init__(self, conv_dim=64, c_dim=5, repeat_num=6):
         super().__init__()
-        self.project = ProjectAndReshape((8, 8, 512), num_latent)
-        self.net = nn.Sequential(
-            nn.ConvTranspose2d(512, 4 * ngf, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(4 * ngf),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(4 * ngf, 2 * ngf, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.BatchNorm2d(2 * ngf),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(2 * ngf, ngf, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.BatchNorm2d(ngf),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(ngf, out_channels, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.Tanh()
-        )
+        
+        layers = []
+        layers.append(nn.Conv2d(3 + c_dim, conv_dim, kernel_size=7, stride=1, padding=3, bias=False))
+        layers.append(nn.InstanceNorm2d(conv_dim, affine=True))
+        layers.append(nn.ReLU(inplace=True))
+        
+        curr_dim = conv_dim
+        for i in range(2):
+            layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim * 2, affine=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim * 2
+        
+        for i in range(repeat_num):
+            layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
+        
+        for i in range(2):
+            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim // 2, kernel_size=4, stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim // 2, affine=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim // 2
+        
+        layers.append(nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False))
+        layers.append(nn.Tanh())
+        self.main = nn.Sequential(*layers)
 
-    def forward(self, z):
-        if z.dim() == 4:
-            z = z.view(z.size(0), z.size(1))
-        x = self.project(z)
-        return self.net(x)
+    def forward(self, x, c):
+        c = c.view(c.size(0), c.size(1), 1, 1)
+        c = c.repeat(1, 1, x.size(2), x.size(3))
+        x = torch.cat([x, c], dim=1)
+        return self.main(x)
 
 
 class Discriminator(nn.Module):
-    def __init__(self, ndf=64, in_channels=3, slope=0.2):
+    """StarGAN Discriminator with PatchGAN and domain classification."""
+    def __init__(self, image_size=128, conv_dim=64, c_dim=5, repeat_num=6):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Conv2d(in_channels, ndf, kernel_size=5, stride=2, padding=2),
-            nn.LeakyReLU(slope, inplace=True),
-            nn.Conv2d(ndf, 2 * ndf, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm2d(2 * ndf),
-            nn.LeakyReLU(slope, inplace=True),
-            nn.Conv2d(2 * ndf, 4 * ndf, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm2d(4 * ndf),
-            nn.LeakyReLU(slope, inplace=True),
-            nn.Conv2d(4 * ndf, 8 * ndf, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm2d(8 * ndf),
-            nn.LeakyReLU(slope, inplace=True),
-            nn.Conv2d(8 * ndf, 1, kernel_size=4, stride=1)
-        )
+        layers = []
+        layers.append(nn.Conv2d(3, conv_dim, kernel_size=4, stride=2, padding=1))
+        layers.append(nn.LeakyReLU(0.01))
 
+        curr_dim = conv_dim
+        for i in range(1, repeat_num):
+            layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1))
+            layers.append(nn.LeakyReLU(0.01))
+            curr_dim = curr_dim * 2
+
+        kernel_size = int(image_size / np.power(2, repeat_num))
+        self.main = nn.Sequential(*layers)
+        self.conv_src = nn.Conv2d(curr_dim, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv_cls = nn.Conv2d(curr_dim, c_dim, kernel_size=kernel_size, bias=False)
+        
     def forward(self, x):
-        return self.net(x)
+        h = self.main(x)
+        out_src = self.conv_src(h)
+        out_cls = self.conv_cls(h)
+        return out_src, out_cls.view(out_cls.size(0), out_cls.size(1))
 
 
-def sigmoid(x):
-    return torch.sigmoid(x)
+def gradient_penalty(discriminator, real_images, fake_images, device):
+    """Compute gradient penalty for WGAN-GP."""
+    alpha = torch.rand(real_images.size(0), 1, 1, 1).to(device)
+    interpolates = (alpha * real_images + (1 - alpha) * fake_images).requires_grad_(True)
+    d_interpolates, _ = discriminator(interpolates)
+    fake = torch.ones(d_interpolates.size()).to(device)
+    
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
 
 
-def gan_loss(prob_real, prob_generated):
-    eps = 1e-8
-    loss_discriminator = -torch.mean(torch.log(prob_real + eps)) - torch.mean(torch.log(1 - prob_generated + eps))
-    loss_generator = -torch.mean(torch.log(prob_generated + eps))
-    return loss_generator, loss_discriminator
+def classification_loss(logit, target):
+    """Compute binary or softmax cross entropy loss."""
+    return F.cross_entropy(logit, target)
+
+
+def label2onehot(labels, dim):
+    """Convert label indices to one-hot vectors."""
+    batch_size = labels.size(0)
+    out = torch.zeros(batch_size, dim, device=labels.device)
+    out[np.arange(batch_size), labels.long().cpu()] = 1
+    return out
+
+
+def create_labels(c_org, c_dim, device, selected_attrs=None):
+    """Generate target domain labels for debugging and testing."""
+    c_trg_list = []
+    for i in range(c_dim):
+        c_trg = label2onehot(torch.ones(c_org.size(0)) * i, c_dim)
+        c_trg_list.append(c_trg.to(device))
+    return c_trg_list
 
 
 def save(tensor, out_dir, prefix: Optional[str] = None):
@@ -169,14 +219,16 @@ def make_mixed_dataloader(real_folder: Path, gen_folder: Optional[Path], gen_rat
     
     transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(), 
-        transforms.Lambda(lambda t: t * 2 - 1) 
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
 
     class SimpleFolder(torch.utils.data.Dataset):
-        def __init__(self, paths, transform):
+        def __init__(self, paths, transform, num_domains):
             self.paths = paths
             self.transform = transform
+            self.num_domains = num_domains
 
         def __len__(self):
             return len(self.paths)
@@ -184,9 +236,10 @@ def make_mixed_dataloader(real_folder: Path, gen_folder: Optional[Path], gen_rat
         def __getitem__(self, idx):
             p = self.paths[idx]
             img = Image.open(p).convert('RGB')
-            return self.transform(img)
+            label = torch.randint(0, self.num_domains, (1,)).item()
+            return self.transform(img), label
 
-    ds = SimpleFolder(all_imgs, transform)
+    ds = SimpleFolder(all_imgs, transform, NUM_DOMAINS)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
     return dl
 
@@ -203,81 +256,106 @@ def train_for_folder(round_num: int, path_real: Path, path_gen_prev: Optional[Pa
         print(f'No images available, skipping round {round_num}')
         return
 
-    netG = Generator(num_latent=NUM_LATENT).to(device)
-    netD = Discriminator().to(device)
+    netG = Generator(conv_dim=64, c_dim=NUM_DOMAINS, repeat_num=6).to(device)
+    netD = Discriminator(image_size=IMAGE_SIZE, conv_dim=64, c_dim=NUM_DOMAINS, repeat_num=6).to(device)
     netG.apply(weights_init)
     netD.apply(weights_init)
 
     optimG = torch.optim.Adam(netG.parameters(), lr=LEARN_RATE, betas=(BETA1, BETA2))
     optimD = torch.optim.Adam(netD.parameters(), lr=LEARN_RATE, betas=(BETA1, BETA2))
 
-    z_val = torch.randn(NUM_VALIDATION_IMAGES, NUM_LATENT, device=device)
+    fixed_x = []
+    fixed_c = []
 
     iteration = 0
     for epoch in range(1, NUM_EPOCHS + 1):
-        for real_batch in dataloader:
+        for real_x, real_label in dataloader:
             iteration += 1
-            real_batch = real_batch.to(device)
-            bs = real_batch.size(0)
+            real_x = real_x.to(device)
+            real_label = real_label.to(device)
+            bs = real_x.size(0)
 
-            z = torch.randn(bs, NUM_LATENT, device=device)
+            rand_idx = torch.randperm(real_label.size(0))
+            target_label = real_label[rand_idx]
+            
+            real_c = label2onehot(real_label, NUM_DOMAINS).to(device)
+            target_c = label2onehot(target_label, NUM_DOMAINS).to(device)
 
-            with torch.no_grad():
-                pass
+            # Train Discriminator
+            out_src, out_cls = netD(real_x)
+            d_loss_real = -torch.mean(out_src)
+            d_loss_cls = classification_loss(out_cls, real_label)
 
-            d_real = netD(real_batch)
-            fake = netG(z)
-            d_fake = netD(fake.detach())
+            fake_x = netG(real_x, target_c)
+            out_src, out_cls = netD(fake_x.detach())
+            d_loss_fake = torch.mean(out_src)
 
-            real_targets = torch.ones_like(d_real, device=device)
-            fake_targets = torch.zeros_like(d_fake, device=device)
-
-            num_obs = real_targets.shape[0]
-            num_to_flip = int(math.floor(FLIP_FACTOR * num_obs))
-            if num_to_flip > 0:
-                flip_idx = random.sample(range(num_obs), num_to_flip)
-                real_targets[flip_idx] = 0.0
-
-            criterion = nn.BCEWithLogitsLoss()
-            lossD = criterion(d_real, real_targets) + criterion(d_fake, fake_targets)
+            d_loss_gp = gradient_penalty(netD, real_x, fake_x, device)
+            d_loss = d_loss_real + d_loss_fake + LAMBDA_CLS * d_loss_cls + LAMBDA_GP * d_loss_gp
 
             optimD.zero_grad()
-            lossD.backward()
+            d_loss.backward()
             optimD.step()
 
-            d_fake_forG = netD(netG(z))
-            real_targets_forG = torch.ones_like(d_fake_forG, device=device)
-            lossG2 = criterion(d_fake_forG, real_targets_forG)
-            optimG.zero_grad()
-            lossG2.backward()
-            optimG.step()
+            # Train Generator
+            if iteration % 5 == 0:
+                fake_x = netG(real_x, target_c)
+                out_src, out_cls = netD(fake_x)
+                g_loss_fake = -torch.mean(out_src)
+                g_loss_cls = classification_loss(out_cls, target_label)
 
-            with torch.no_grad():
-                prob_real = torch.sigmoid(d_real)
-                prob_fake = torch.sigmoid(d_fake)
-                scoreD = ((prob_real.mean() + (1 - prob_fake.mean())) / 2).item()
-                scoreG = prob_fake.mean().item()
+                reconstructed_x = netG(fake_x, real_c)
+                g_loss_rec = torch.mean(torch.abs(real_x - reconstructed_x))
+
+                g_loss = g_loss_fake + LAMBDA_REC * g_loss_rec + LAMBDA_CLS * g_loss_cls
+
+                optimG.zero_grad()
+                g_loss.backward()
+                optimG.step()
+            else:
+                g_loss = torch.tensor(0.0)
 
             if iteration % VALIDATION_FREQUENCY == 0 or iteration == 1:
-                with torch.no_grad():
-                    gval = netG(z_val)
-                    if epoch > (NUM_EPOCHS // 2):
+                if len(fixed_x) < NUM_VALIDATION_IMAGES and real_x.size(0) > 0:
+                    fixed_x.append(real_x[0:1].cpu())
+                    fixed_c.append(real_c[0:1].cpu())
+                
+                if len(fixed_x) >= min(NUM_VALIDATION_IMAGES, 5) and epoch > (NUM_EPOCHS // 4):
+                    with torch.no_grad():
                         try:
+                            x_concat = []
+                            for i in range(min(len(fixed_x), 5)):
+                                x_fixed = fixed_x[i].to(device)
+                                for j in range(NUM_DOMAINS):
+                                    c_trg = label2onehot(torch.tensor([j]), NUM_DOMAINS).to(device)
+                                    x_fake = netG(x_fixed, c_trg)
+                                    x_concat.append(x_fake)
+                            
+                            x_concat = torch.cat(x_concat, dim=0)
                             prefix = f'round{round_num}_iter{iteration:06d}_ep{epoch:03d}'
-                            save(gval[:NUM_VALIDATION_IMAGES], path_gen_out, prefix=prefix)
-                        except Exception:
-                            pass
+                            save(x_concat, path_gen_out, prefix=prefix)
+                        except Exception as e:
+                            print(f"Error saving validation images: {e}")
 
             if iteration % 10 == 0:
-                print(f'Round {round_num} | Epoch {epoch} Iter {iteration} | G_loss {lossG2.item():.4f} D_loss {lossD.item():.4f} | sG {scoreG:.4f} sD {scoreD:.4f}')
-                logging.info(f'Round {round_num} | G_loss {lossG2.item():.4f} | D_loss {lossD.item():.4f}')
+                print(f'Round {round_num} | Epoch {epoch} Iter {iteration} | G_loss {g_loss.item():.4f} D_loss {d_loss.item():.4f} | D_real {d_loss_real.item():.4f} D_fake {d_loss_fake.item():.4f}')
+                logging.info(f'Round {round_num} | G_loss {g_loss.item():.4f} | D_loss {d_loss.item():.4f}')
 
     print(f'Finished round {round_num}')
     
     with torch.no_grad():
-        z_final = torch.randn(NUM_VALIDATION_IMAGES, NUM_LATENT, device=device)
-        gval_final = netG(z_final)
-        save(gval_final, path_gen_out, prefix=f'round{round_num}_final')
+        if len(fixed_x) > 0:
+            x_concat = []
+            for i in range(min(len(fixed_x), NUM_VALIDATION_IMAGES)):
+                x_fixed = fixed_x[i].to(device)
+                for j in range(NUM_DOMAINS):
+                    c_trg = label2onehot(torch.tensor([j]), NUM_DOMAINS).to(device)
+                    x_fake = netG(x_fixed, c_trg)
+                    x_concat.append(x_fake)
+            
+            if len(x_concat) > 0:
+                x_concat = torch.cat(x_concat, dim=0)
+                save(x_concat, path_gen_out, prefix=f'round{round_num}_final')
     
     return netG
 
